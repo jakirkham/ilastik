@@ -404,19 +404,24 @@ class OpObjectClassification(Operator, MultiLaneOperatorABC):
         labelslot.setDirty([(timeCoord, objIndex)])
 
         #Fill the cache of label bounding boxes, if it was empty
-        if len(self._labelBBoxes[imageIndex].keys())==0:
-            #it's the first label for this image
-            feats = self.ObjectFeatures[imageIndex]([timeCoord]).wait()
-
-            #the bboxes should be the same for all channels
-            mins = feats[timeCoord][default_features_key]["Coord<Minimum>"]
-            maxs = feats[timeCoord][default_features_key]["Coord<Maximum>"]
-            bboxes = dict()
-            bboxes["Coord<Minimum>"] = mins
-            bboxes["Coord<Maximum>"] = maxs
-            self._labelBBoxes[imageIndex][timeCoord]=bboxes
+        # FIXME: TRANSFER LABELS:
+        #        Apparently this code was required for triggerTransferLabels(),
+        #        But it has the unfortunate effect of synchronously computing the object features for the current image
+        #        as soon as the user has clicked her first label.  It causes quite a noticeable lag!
+#         if len(self._labelBBoxes[imageIndex].keys())==0:
+#             #it's the first label for this image
+#             feats = self.ObjectFeatures[imageIndex]([timeCoord]).wait()
+# 
+#             #the bboxes should be the same for all channels
+#             mins = feats[timeCoord][default_features_key]["Coord<Minimum>"]
+#             maxs = feats[timeCoord][default_features_key]["Coord<Maximum>"]
+#             bboxes = dict()
+#             bboxes["Coord<Minimum>"] = mins
+#             bboxes["Coord<Maximum>"] = maxs
+#             self._labelBBoxes[imageIndex][timeCoord]=bboxes
 
     def triggerTransferLabels(self, imageIndex):
+        # FIXME: This function no longer works, partly thanks to the code commented out above.  See "FIXME: TRANSFER LABELS"
         if not self._needLabelTransfer:
             return None
         if not self.SegmentationImages[imageIndex].ready():
@@ -1003,6 +1008,13 @@ class OpObjectPredict(Operator):
 
         selected = self.SelectedFeatures([]).wait()
 
+        def get_num_objects(extracted_features):
+            n = 0
+            for group, feature_dict in extracted_features.items():
+                for feature_name, feature_matrix in feature_dict.items():
+                    n = max(n, len(feature_matrix))
+            return n
+
         # FIXME: self.prob_cache is shared, so we need to block.
         # However, this makes prediction single-threaded.
         with self.lock:
@@ -1010,33 +1022,45 @@ class OpObjectPredict(Operator):
                 if t in self.prob_cache:
                     continue
 
+                # Initialize with a single value for the 'background object '
+                prob_predictions[t] = numpy.zeros( (1, len(self.ProbabilityChannels)), dtype=numpy.float32 )
                 tmpfeats = self.Features([t]).wait()
+                num_objects = get_num_objects(tmpfeats[t])
+
+                # Apparently self.Features always returns a background object, 
+                #  so we expect at least 1 object in the list, even if there's nothing to predict.
+                assert num_objects > 0
+                if num_objects == 1:
+                    continue
+                    
                 ftmatrix, _, col_names = make_feature_array(tmpfeats, selected)
                 rows, cols = replace_missing(ftmatrix)
                 self.bad_objects[t] = numpy.zeros((ftmatrix.shape[0],))
                 self.bad_objects[t][rows] = 1
                 feats[t] = ftmatrix
-                prob_predictions[t] = 0
 
-            def predict_forest(_t):
-                # Note: We can't use RandomForest.predictLabels() here because we're training in parallel,
-                #        and we have to average the PROBABILITIES from all forests.
-                #       Averaging the label predictions from each forest is NOT equivalent.
-                #       For details please see wikipedia:
-                #       http://en.wikipedia.org/wiki/Electoral_College_%28United_States%29#Irrelevancy_of_national_popular_vote
-                #       (^-^)
-                prob_predictions[_t] = classifier.predict_probabilities(feats[_t].astype(numpy.float32))
-
-            # predict the data with all the forests in parallel
-            pool = RequestPool()
-            for t in times:
-                if t in self.prob_cache:
-                    continue
-                req = Request( partial(predict_forest, t) )
-                pool.add(req)
-
-            pool.wait()
-            pool.clean()
+            # Are there any objects to predict?
+            if len(feats) > 0:
+                def predict_forest(_t):
+                    # Note: We can't use RandomForest.predictLabels() here because we're training in parallel,
+                    #        and we have to average the PROBABILITIES from all forests.
+                    #       Averaging the label predictions from each forest is NOT equivalent.
+                    #       For details please see wikipedia:
+                    #       http://en.wikipedia.org/wiki/Electoral_College_%28United_States%29#Irrelevancy_of_national_popular_vote
+                    #       (^-^)
+                    prob_predictions[_t] = classifier.predict_probabilities(feats[_t].astype(numpy.float32))
+    
+                # predict the data with all the forests in parallel
+                pool = RequestPool()
+                for t in times:
+                    if t in self.prob_cache:
+                        continue
+                    logger.debug("Predicting object probabilities for time step: {}".format( t ))
+                    req = Request( partial(predict_forest, t) )
+                    pool.add(req)
+    
+                pool.wait()
+                pool.clean()
 
             for t in times:
                 if t not in self.prob_cache:
